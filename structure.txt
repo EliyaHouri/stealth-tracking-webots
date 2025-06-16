@@ -1,0 +1,20 @@
+stealth_tracking/
+├── world/
+│   └── epuck2_tracking.wbt
+├── controllers/
+│   ├── target_controller/
+│   │   └── target_controller.py
+│   └── observer_controller/
+│       └── observer_controller.py
+├── src/
+│   ├── world_model.py
+│   ├── discretization.py
+│   ├── distributions.py
+│   ├── dp_solver.py
+│   └── utils.py
+├── tests/
+│   ├── test_world_model.py
+│   ├── test_discretization.py
+│   └── test_dp_solver.py
+├── requirements.txt
+└── README.md
