@@ -9,118 +9,85 @@ import networkx as nx
 
 from world_model import WorldModel
 from discretization import GraphBuilder
+from dijkstra_planner import compute_cruise_path
 from distributions import Distributions
 from utils import is_visible, is_detected
 
 
-def advance_target(state, cruise_path, k, p_sus):
+def advance_target_states(cruise_path, step_index, p_sus):
     """
-    Given target state (node, sus, scan_i), return list of (prob, 
-next_state) tuples.
-    state: (x, y, theta, sus, i)
-    cruise_path: list of (x,y,theta)
+    Given the cruise_path list of (x,y,h,sus,i) states, produce next possible target states with probabilities.
     """
-    x, y, theta, sus, i = state
+    x, y, theta, sus, i = cruise_path[step_index]
+    # if at final step, remain
+    if step_index + 1 >= len(cruise_path):
+        return [(1.0, cruise_path[step_index])]
+    # normal mode
     if sus == 0:
-        # normal cruising
-        next_cruise = cruise_path[k+1]
-        # stay normal
-        normal = (*next_cruise, 0, 0)
-        # enter suspicious scan
+        next_node = cruise_path[step_index + 1][:3]  # x,y,theta
+        normal = (*next_node, 0, 0)
         scan = (x, y, theta, 1, 1)
         return [(1 - p_sus, normal), (p_sus, scan)]
-    else:
-        # in scan mode: three in-place turns
-        prev_heading = cruise_path[k][2]
-        if i == 1:
-            new_theta = prev_heading + math.pi/2
-            return [(1.0, (x, y, new_theta, 1, 2))]
-        if i == 2:
-            new_theta = prev_heading - math.pi/2
-            return [(1.0, (x, y, new_theta, 1, 3))]
-        if i == 3:
-            new_theta = prev_heading + math.pi
-            # after scan return to normal at next time-step
-            return [(1.0, (x, y, prev_heading, 0, 0))]
-    # should not reach
-    return []
+    # suspicious scan modes
+    prev_theta = theta
+    if i == 1:
+        return [(1.0, (x, y, prev_theta + math.pi/2, 1, 2))]
+    if i == 2:
+        return [(1.0, (x, y, prev_theta - math.pi/2, 1, 3))]
+    if i == 3:
+        return [(1.0, (x, y, prev_theta, 0, 0))]
+    return [(1.0, cruise_path[step_index])]
 
 
-def solve_dp(obstacles_file, cruise_file, output_file, v, tau, r, gamma, 
-r_d, p_sus, K):
-    # load world
-    world = WorldModel(obstacles_file)
-    # build graph
-    gb = GraphBuilder(world, v, tau)
-    G = gb.build()
-    nodes = list(G.nodes())
-    # load cruise path
-    cruise_data = json.load(open(cruise_file))
-    cruise_path = cruise_data['path']  # list of [x,y,theta]
+def solve_dp_with_path(G, world, cruise_path, r, gamma, r_d, K):
+    # Precompute successor map
+    successors = {node: list(G.successors(node)) for node in G.nodes()}
 
-    # backward pruning sets
-    H = [set() for _ in range(K+2)]
-    H[K] = set(nodes)
-    # successors
-    succ = {n: list(G.successors(n)) for n in nodes}
+    # Backward reachable observer states
+    H = [set() for _ in range(K+1)]
+    H[K] = set(G.nodes())
+    for k in range(K-1, -1, -1):
+        H[k] = {s for s in G.nodes() if any(succ in H[k+1] for succ in successors[s])}
 
-    # DP value tables
-    V_next = {}  # mapping (s_o, tgt_state) -> value
+    # DP tables
+    V_next = {}
+    policy = {}
 
-    # initialize V_{K+1} = 0
-    # iterate backward
-    for k in range(K, -1, -1):
-        # compute reachable observer nodes
-        if k < K:
-            H[k] = {s for s,ss in succ.items() if any(succ_node in H[k+1] 
-for succ_node in ss)}
-        # current DP table
+    # Iterate backwards in time
+    for k in reversed(range(K)):
         V_curr = {}
-        # for each possible observer state
         for s_o in H[k]:
-            for sus in (0, 1):
-                for i in (0,1,2,3) if sus else (0,):
-                    # determine target state at step k
-                    x_t, y_t, theta_t = cruise_path[k]
-                    s_t = (x_t, y_t, theta_t, sus, i)
-                    # evaluate best action
-                    best_val = -np.inf
+            for sus in (0,1):
+                for i in ([0] if sus==0 else [1,2,3]):
+                    # target state at time k
+                    x_t, y_t, theta_t, _, _ = cruise_path[k]
+                    best_val = -math.inf
                     best_action = None
-                    for s_o_next in succ[s_o]:
-                        # reward at time k
-                        rwd = int(is_visible((s_o[0], s_o[1]), s_o[2], 
-(x_t, y_t), world, r, gamma)
-                                  and not is_detected((x_t, y_t), theta_t,
-                                                      (s_o[0], s_o[1]), 
-world, r_d, r, gamma))
-                        # sum over target transitions
+                    for s_o_next in successors[s_o]:
+                        # compute reward
+                        vis = is_visible((s_o[0],s_o[1]), s_o[2], (x_t,y_t), world, r, gamma)
+                        det = is_detected((x_t,y_t), theta_t, (s_o[0],s_o[1]), world, r_d, r, gamma)
+                        reward = 1 if (vis and not det) else 0
                         exp_future = 0.0
-                        for prob, s_t_next in advance_target(s_t, 
-cruise_path, k, p_sus):
-                            key_next = (s_o_next, *s_t_next)
-                            v_next = V_next.get(key_next, 0.0)
-                            exp_future += prob * v_next
-                        val = rwd + exp_future
+                        # sum over target transitions
+                        for prob, s_t_next in advance_target_states(cruise_path, k, dist.p_sus):
+                            key_next = (k+1, s_o_next, *s_t_next)
+                            exp_future += prob * V_next.get(key_next, 0.0)
+                        val = reward + exp_future
                         if val > best_val:
                             best_val = val
                             best_action = s_o_next
-                    # store
-                    key = (k, s_o, *s_t)
+                    key = (k, s_o, x_t, y_t, theta_t, sus, i)
                     V_curr[key] = best_val
-                    # policy: map z -> best observer successor
                     policy[key] = best_action
         V_next = V_curr
-    # save policy
-    with open(output_file, 'wb') as f:
-        pickle.dump(policy, f)
-    print(f"Policy saved to {output_file}")
+    return policy
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--obstacles', required=True)
-    parser.add_argument('--path', required=True)
-    parser.add_argument('--output', required=True)
+    parser.add_argument('--seed', type=int, required=True)
+    parser.add_argument('--num_obs', type=int, default=5)
     parser.add_argument('--v', type=float, default=0.1)
     parser.add_argument('--tau', type=float, default=1.0)
     parser.add_argument('--r', type=float, default=5.0)
@@ -130,15 +97,31 @@ if __name__ == '__main__':
     parser.add_argument('--K', type=int, default=20)
     args = parser.parse_args()
 
-    solve_dp(
-        args.obstacles,
-        args.path,
-        args.output,
-        args.v,
-        args.tau,
-        args.r,
-        args.gamma,
-        args.r_d,
-        args.p_sus,
-        args.K
-    )
+    # Generate obstacles
+    boundary = [[-1,-1],[1,-1],[1,1],[-1,1]]
+    obs_list = generate_obstacles(args.seed, args.num_obs, boundary)
+    with open('obstacles.json','w') as f:
+        json.dump({'boundary': boundary, 'obstacles': obs_list}, f)
+
+    # Build world and graph
+    world = WorldModel('obstacles.json')
+    gb = GraphBuilder(world, args.v, args.tau)
+    G = gb.build()
+
+    # Compute cruise path
+    nodes = list(G.nodes())
+    start, goal = nodes[0], nodes[-1]
+    cruise_nodes = compute_cruise_path(G, start, goal)
+
+    # Sample suspicious flags
+    dist = Distributions(args.p_sus)
+    cruise_path = []
+    for idx, node in enumerate(cruise_nodes):
+        sus_flag = dist.sample_suspicious()
+        cruise_path.append((*node, sus_flag, 0))
+
+    # Solve DP
+    policy = solve_dp_with_path(G, world, cruise_path, args.r, args.gamma, args.r_d, args.K)
+    with open('policy.pkl','wb') as f:
+        pickle.dump(policy, f)
+    print(f"Policy saved to policy.pkl")

@@ -14,8 +14,9 @@ Polygonal Environments_ in Python and Webots.
   - `utils.py` – geometry helpers (visibility, detection).
 - `tests/` – unit tests for key modules.
 
-## Setup
-```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+## New pipeline
+1. `python src/world_generator.py` — generates `obstacles.json` with fixed seed.
+2. `python src/dp_solver.py --seed 42 --num_obs 5` — builds graph, computes Dijkstra path, samples suspicious flags, and solves DP, outputting `policy.pkl`.
+3. Launch Webots:
+   ```bash
+   webots world/epuck2_tracking.wbt
